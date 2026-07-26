@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import hashlib
 import feedparser
 import httpx
 import asyncio
@@ -18,6 +19,9 @@ HOURS_AGO = 24
 # Максимум 5 лучших новостей за запуск
 MAX_NEWS_TO_SEND = 5
 
+# Минимальный порог важности для отправки (1-10)
+MIN_RELEVANCE_SCORE = 7
+
 RSS_FEEDS = [
     "https://www.theblock.co/rss.xml",
     "https://www.binance.com/en/blog/rss",
@@ -27,31 +31,40 @@ RSS_FEEDS = [
     "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
+    "https://cryptoslate.com/feed/",
+    "https://blockworks.co/news/rss",
 ]
 
 # Ключевые слова для фильтрации
-EXCHANGES = ["binance", "kraken", "okx", "bybit", "coinbase"]
-STABLECOINS = ["usdt", "usdc", "tether", "circle", "stablecoin", "e-money token", "emt", "art"]
+EXCHANGES = ["binance", "kraken", "okx", "bybit", "coinbase", "htx", "gate.io", "bitfinex"]
+STABLECOINS = ["usdt", "usdc", "tether", "circle", "stablecoin", "e-money token", "emt", "art", "dai", "busd"]
 REGULATORY = [
     "mica", "caspr", "license", "authorized", "sepa", "sepainstant",
     "кипр", "cyprus", "налог", "tax", "aml", "travel rule", "bafin", "amf",
-    "esma", "eba", "ecb", "dlr", "crypto-asset", "casp"
+    "esma", "eba", "ecb", "dlr", "crypto-asset", "casp", "sanctions",
+    "regulation", "compliance", "directive", "legislation"
 ]
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 
 def load_sent_news():
-    """Загружает список уже отправленных новостей из файла."""
+    """Загружает список уже отправленных новостей."""
     try:
         with open('sent_news.json', 'r') as f:
             return json.load(f)
     except:
-        return []
+        return {"urls": [], "hashes": []}
 
 def save_sent_news(sent_news):
     """Сохраняет список отправленных новостей."""
     with open('sent_news.json', 'w') as f:
         json.dump(sent_news, f, indent=2)
+
+def get_title_hash(title):
+    """Создаёт хэш заголовка для обнаружения дубликатов."""
+    # Нормализуем заголовок: убираем лишние пробелы, приводим к нижнему регистру
+    normalized = re.sub(r'\s+', ' ', title.strip().lower())
+    return hashlib.md5(normalized.encode()).hexdigest()
 
 def parse_entry_date(entry):
     """Пытается извлечь дату публикации из RSS-записи."""
@@ -85,15 +98,39 @@ def is_news_fresh(entry, hours_ago):
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
     return pub_date >= cutoff
 
+def is_relevant_for_source(source_name, url, text):
+    """Проверяет релевантность новости для конкретного источника."""
+    source_lower = source_name.lower()
+    url_lower = url.lower()
+    
+    # Для Cyprus Mail и других общих новостей — строгая проверка
+    if "cyprus-mail" in url_lower or "cyprus mail" in source_lower:
+        crypto_keywords = [
+            "crypto", "bitcoin", "ethereum", "blockchain", "stablecoin", 
+            "usdt", "usdc", "налог", "tax", "capital gains", "vat",
+            "miica", "regulation", "license", "exchange", "trading",
+            "кипр", "cyprus tax", "non-dom", "resident"
+        ]
+        return any(kw in text for kw in crypto_keywords)
+    
+    # Для остальных — стандартная проверка
+    has_exchange = any(ex in text for ex in EXCHANGES)
+    has_stable = any(st in text for st in STABLECOINS)
+    has_reg = any(reg in text for reg in REGULATORY)
+    
+    return (has_exchange or has_stable) and has_reg
+
 def fetch_and_filter_rss():
-    """Собирает RSS и фильтрует по ключевым словам + дате."""
+    """Собирает RSS и фильтрует по ключевым словам + дате + дубликатам."""
     all_news = []
     skipped_old = 0
     skipped_irrelevant = 0
     skipped_already_sent = 0
+    skipped_duplicates = 0
     
-    # Загружаем уже отправленные ссылки
-    sent_links = set(load_sent_news())
+    sent_data = load_sent_news()
+    sent_urls = set(sent_data.get("urls", []))
+    sent_hashes = set(sent_data.get("hashes", []))
     
     for url in RSS_FEEDS:
         feed = feedparser.parse(url)
@@ -104,24 +141,25 @@ def fetch_and_filter_rss():
             summary = entry.get('summary', entry.get('description', ''))
             link = entry.get('link', '')
             
-            # 1. Проверяем, не отправляли ли уже
-            if link in sent_links:
+            # 1. Проверяем, не отправляли ли уже (по URL)
+            if link in sent_urls:
                 skipped_already_sent += 1
                 continue
             
-            # 2. Фильтр по дате
+            # 2. Проверяем дубликаты по хэшу заголовка
+            title_hash = get_title_hash(title)
+            if title_hash in sent_hashes:
+                skipped_duplicates += 1
+                continue
+            
+            # 3. Фильтр по дате
             if not is_news_fresh(entry, HOURS_AGO):
                 skipped_old += 1
                 continue
             
-            # 3. Фильтр по ключевым словам
+            # 4. Фильтр по релевантности для источника
             text = f"{title} {summary}".lower()
-            
-            has_exchange = any(ex in text for ex in EXCHANGES)
-            has_stable = any(st in text for st in STABLECOINS)
-            has_reg = any(reg in text for reg in REGULATORY)
-            
-            if not ((has_exchange or has_stable) and has_reg):
+            if not is_relevant_for_source(source_name, url, text):
                 skipped_irrelevant += 1
                 continue
             
@@ -129,10 +167,12 @@ def fetch_and_filter_rss():
                 'title': title,
                 'summary': summary,
                 'link': link,
-                'source': source_name
+                'source': source_name,
+                'title_hash': title_hash
             })
     
     print(f"Пропущено уже отправленных: {skipped_already_sent}")
+    print(f"Пропущено дубликатов: {skipped_duplicates}")
     print(f"Пропущено устаревших: {skipped_old}")
     print(f"Пропущено нерелевантных: {skipped_irrelevant}")
     print(f"Найдено кандидатов: {len(all_news)}")
@@ -140,7 +180,7 @@ def fetch_and_filter_rss():
     return all_news
 
 async def analyze_with_groq(title, summary):
-    """Анализирует новость через Groq LLM и возвращает оценку важности."""
+    """Анализирует новость через Groq LLM."""
     async with httpx.AsyncClient() as client:
         response = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -155,20 +195,23 @@ async def analyze_with_groq(title, summary):
                         "role": "system",
                         "content": (
                             "Ты — старший аналитик по крипто-регулированию в ЕС. "
-                            "Оцени новость по критериям: "
-                            "1) Лицензирование бирж (Binance, Kraken, OKX, Bybit, Coinbase) по MiCA, "
-                            "2) Операции с USDT/USDC (ограничения, новые пары, изменения в депозитах/выводах), "
-                            "3) SEPA/банкинг (блокировки счетов, новые коридоры), "
-                            "4) Налоги Кипра для криптоактивов. "
-                            "Верни СТРОГО валидный JSON: "
-                            "{\"relevance_score\": 1-10, \"tags\": [\"#MiCA\", \"#SEPA\", \"#CyprusTax\", \"#Stablecoin\", \"#ExchangeLicense\", \"#AMLD6\"], "
+                            "Твоя задача — оценить новость СТРОГО по следующим критериям:\n\n"
+                            "1. Лицензирование бирж (Binance, Kraken, OKX, Bybit, Coinbase) по MiCA\n"
+                            "2. Операции с USDT/USDC (ограничения, новые пары, изменения в депозитах/выводах)\n"
+                            "3. SEPA/банкинг (блокировки счетов, новые коридоры SEPA Instant)\n"
+                            "4. Налоги Кипра для криптоактивов (capital gains, VAT, non-dom)\n"
+                            "5. Санкции ЕС против криптобирж или сервисов\n\n"
+                            "КРИТИЧНО: Если новость НЕ относится к этим темам — ставь relevance_score = 0.\n"
+                            "Не отправляй общие новости про криптовалюты, цены Bitcoin, или политику.\n\n"
+                            "Верни СТРОГО валидный JSON:\n"
+                            "{\"relevance_score\": 0-10, \"tags\": [\"#MiCA\", \"#SEPA\", \"#CyprusTax\", \"#Stablecoin\", \"#ExchangeLicense\", \"#Sanctions\"], "
                             "\"summary_ru\": \"Суть в 2 предложениях с акцентом на последствия для трейдеров/бизнеса\", "
                             "\"action_required\": \"Да/Нет\"}"
                         )
                     },
                     {
                         "role": "user",
-                        "content": f"Заголовок: {title}\nТекст: {summary[:1000]}"
+                        "content": f"Заголовок: {title}\nТекст: {summary[:1200]}"
                     }
                 ],
                 "temperature": 0.2,
@@ -186,9 +229,9 @@ async def analyze_with_groq(title, summary):
             except Exception as e:
                 print(f"Ошибка парсинга JSON от LLM: {e}")
             return {
-                "relevance_score": 5,
-                "tags": ["#General"],
-                "summary_ru": content,
+                "relevance_score": 0,
+                "tags": ["#Error"],
+                "summary_ru": content if content else "Не удалось проанализировать",
                 "action_required": "Нет"
             }
         else:
@@ -211,7 +254,7 @@ async def send_to_telegram(analysis, title, link, source):
         f"<b>{title}</b>\n\n"
         f"{analysis.get('summary_ru', 'Нет описания')}\n\n"
         f"📰 Источник: {source}\n"
-        f"🔗 [Читать оригинал]({link})\n\n"
+        f" [Читать оригинал]({link})\n\n"
         f"Оценка важности: {relevance}/10"
     )
     
@@ -231,6 +274,7 @@ async def main():
     print("=" * 60)
     print("=== Запуск крипто-аналитика ===")
     print(f"Фильтр: новости за последние {HOURS_AGO} часов")
+    print(f"Минимальный порог важности: {MIN_RELEVANCE_SCORE}/10")
     print(f"Максимум новостей: {MAX_NEWS_TO_SEND}")
     print("=" * 60)
     
@@ -238,11 +282,11 @@ async def main():
     all_news = fetch_and_filter_rss()
     
     if not all_news:
-        print("\nНовых релевантных новостей нет. Завершаем работу.")
+        print("\n❌ Новых релевантных новостей нет. Ничего не отправляем.")
         return
     
     # Анализируем ВСЕ найденные новости через LLM
-    print(f"\nАнализируем {len(all_news)} новостей через Groq...")
+    print(f"\n🔍 Анализируем {len(all_news)} новостей через Groq...")
     analyzed_news = []
     
     for news in all_news:
@@ -255,16 +299,26 @@ async def main():
     # Сортируем по оценке важности (от высокой к низкой)
     analyzed_news.sort(key=lambda x: x['relevance_score'], reverse=True)
     
+    # Фильтруем по минимальному порогу
+    qualified_news = [n for n in analyzed_news if n['relevance_score'] >= MIN_RELEVANCE_SCORE]
+    
+    if not qualified_news:
+        print(f"\n❌ Нет новостей с оценкой >= {MIN_RELEVANCE_SCORE}. Ничего не отправляем.")
+        return
+    
     # Берём топ-5
-    top_news = analyzed_news[:MAX_NEWS_TO_SEND]
+    top_news = qualified_news[:MAX_NEWS_TO_SEND]
     
     print(f"\n{'=' * 60}")
-    print(f"Отправляем топ-{len(top_news)} новостей:")
+    print(f"✅ Найдено {len(qualified_news)} новостей с оценкой >= {MIN_RELEVANCE_SCORE}")
+    print(f" Отправляем топ-{len(top_news)}:")
     print("=" * 60)
     
     # Отправляем топ-5
     sent_count = 0
-    sent_links = load_sent_news()
+    sent_data = load_sent_news()
+    sent_urls = sent_data.get("urls", [])
+    sent_hashes = sent_data.get("hashes", [])
     
     for news in top_news:
         relevance = news['relevance_score']
@@ -279,17 +333,19 @@ async def main():
         
         if success:
             print("✅ Отправлено")
-            sent_links.append(news['link'])
+            sent_urls.append(news['link'])
+            sent_hashes.append(news['title_hash'])
             sent_count += 1
         else:
             print("❌ Ошибка отправки")
     
     # Сохраняем обновлённый список
-    save_sent_news(sent_links)
+    save_sent_news({"urls": sent_urls, "hashes": sent_hashes})
     
     print("\n" + "=" * 60)
     print(f"=== Готово! Отправлено: {sent_count} новостей ===")
-    print(f"Всего сохранено отправленных ссылок: {len(sent_links)}")
+    print(f"Всего сохранено URL: {len(sent_urls)}")
+    print(f"Всего сохранено хэшей: {len(sent_hashes)}")
     print("=" * 60)
 
 if __name__ == "__main__":
