@@ -311,16 +311,22 @@ async def main():
     
     print(f"\n{'=' * 60}")
     print(f"✅ Найдено {len(qualified_news)} новостей с оценкой >= {MIN_RELEVANCE_SCORE}")
-    print(f" Отправляем топ-{len(top_news)}:")
+    print(f"📤 Отправляем топ-{len(top_news)}:")
     print("=" * 60)
     
-    # Отправляем топ-5
+    # Отправляем топ-5 с ПРОВЕРКОЙ НА ДУБЛИКАТЫ ВНУТРИ ЦИКЛА
     sent_count = 0
     sent_data = load_sent_news()
-    sent_urls = sent_data.get("urls", [])
-    sent_hashes = sent_data.get("hashes", [])
+    sent_urls = set(sent_data.get("urls", []))  # Используем set для быстрой проверки
+    sent_hashes = set(sent_data.get("hashes", []))
+    already_sent_in_this_run = set()  # Отслеживаем отправленные в ЭТОМ запуске
     
     for news in top_news:
+        # ПРОВЕРКА: не отправляли ли уже в этом запуске (по хэшу)
+        if news['title_hash'] in already_sent_in_this_run:
+            print(f"\n⏭️ Пропущен дубликат: {news['title'][:50]}...")
+            continue
+        
         relevance = news['relevance_score']
         print(f"\n[{relevance}/10] {news['title'][:60]}...")
         
@@ -333,20 +339,21 @@ async def main():
         
         if success:
             print("✅ Отправлено")
-            sent_urls.append(news['link'])
-            sent_hashes.append(news['title_hash'])
+            sent_urls.add(news['link'])
+            sent_hashes.add(news['title_hash'])
+            already_sent_in_this_run.add(news['title_hash'])  # Добавляем в set текущего запуска
             sent_count += 1
         else:
             print("❌ Ошибка отправки")
     
     # Сохраняем обновлённый список
-    save_sent_news({"urls": sent_urls, "hashes": sent_hashes})
+    save_sent_news({"urls": list(sent_urls), "hashes": list(sent_hashes)})
     
     print("\n" + "=" * 60)
     print(f"=== Готово! Отправлено: {sent_count} новостей ===")
     print(f"Всего сохранено URL: {len(sent_urls)}")
     print(f"Всего сохранено хэшей: {len(sent_hashes)}")
     print("=" * 60)
-
+    
 if __name__ == "__main__":
     asyncio.run(main())
