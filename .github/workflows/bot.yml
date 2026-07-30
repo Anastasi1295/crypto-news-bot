@@ -2,7 +2,7 @@ name: Crypto News Bot
 
 on:
   schedule:
-    - cron: '0 */4 * * *' # Запуск каждые 4 часа
+    - cron: '0 */6 * * *' 
   workflow_dispatch: # Ручной запуск
 
 jobs:
