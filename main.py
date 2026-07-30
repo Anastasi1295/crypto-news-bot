@@ -8,6 +8,13 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
+try:
+    from deduplicator import is_semantic_duplicate, load_state, save_state
+    SEMANTIC_DEDUP_ENABLED = True
+except ImportError:
+    SEMANTIC_DEDUP_ENABLED = False
+    print("⚠️ Warning: deduplicator.py не найден. Используется только базовая проверка по хэшу.")
+          
 # === НАСТРОЙКИ ===
 TELEGRAM_BOT_TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 CHANNEL_ID = os.environ['CHANNEL_ID']
@@ -33,6 +40,8 @@ RSS_FEEDS = [
     "https://decrypt.co/feed",
     "https://cryptoslate.com/feed/",
     "https://blockworks.co/news/rss",
+    "https://www.financemagnates.com/feed/",
+    "https://rsshub.app/telegram/channel/chainalysisinc"
 ]
 
 # Ключевые слова для фильтрации
@@ -121,7 +130,6 @@ def is_relevant_for_source(source_name, url, text):
     return (has_exchange or has_stable) and has_reg
 
 def fetch_and_filter_rss():
-    """Собирает RSS и фильтрует по ключевым словам + дате + дубликатам."""
     all_news = []
     skipped_old = 0
     skipped_irrelevant = 0
@@ -132,6 +140,9 @@ def fetch_and_filter_rss():
     sent_urls = set(sent_data.get("urls", []))
     sent_hashes = set(sent_data.get("hashes", []))
     
+    # Загружаем семантический кэш
+    semantic_state = load_state() if SEMANTIC_DEDUP_ENABLED else []
+    
     for url in RSS_FEEDS:
         feed = feedparser.parse(url)
         source_name = feed.feed.get('title', url)
@@ -141,23 +152,30 @@ def fetch_and_filter_rss():
             summary = entry.get('summary', entry.get('description', ''))
             link = entry.get('link', '')
             
-            # 1. Проверяем, не отправляли ли уже (по URL)
+            # 1. Проверяем по URL (быстро и надежно)
             if link in sent_urls:
                 skipped_already_sent += 1
                 continue
             
-            # 2. Проверяем дубликаты по хэшу заголовка
+            # 2. Проверяем по хэшу заголовка (быстрый фильтр)
             title_hash = get_title_hash(title)
             if title_hash in sent_hashes:
                 skipped_duplicates += 1
                 continue
             
-            # 3. Фильтр по дате
+            # 3. Семантическая проверка (ловит разные формулировки одного события)
+            text_to_check = f"{title} {summary}"
+            if SEMANTIC_DEDUP_ENABLED and is_semantic_duplicate(text_to_check, semantic_state):
+                skipped_duplicates += 1
+                print(f"  [Смысловой дубликат] {title[:50]}...")
+                continue
+            
+            # 4. Фильтр по дате
             if not is_news_fresh(entry, HOURS_AGO):
                 skipped_old += 1
                 continue
             
-            # 4. Фильтр по релевантности для источника
+            # 5. Фильтр по релевантности
             text = f"{title} {summary}".lower()
             if not is_relevant_for_source(source_name, url, text):
                 skipped_irrelevant += 1
@@ -168,11 +186,12 @@ def fetch_and_filter_rss():
                 'summary': summary,
                 'link': link,
                 'source': source_name,
-                'title_hash': title_hash
+                'title_hash': title_hash,
+                'text_to_check': text_to_check # <<< НОВОЕ: сохраняем для обновления кэша
             })
     
-    print(f"Пропущено уже отправленных: {skipped_already_sent}")
-    print(f"Пропущено дубликатов: {skipped_duplicates}")
+    print(f"Пропущено уже отправленных (URL): {skipped_already_sent}")
+    print(f"Пропущено дубликатов (хэш + семантика): {skipped_duplicates}")
     print(f"Пропущено устаревших: {skipped_old}")
     print(f"Пропущено нерелевантных: {skipped_irrelevant}")
     print(f"Найдено кандидатов: {len(all_news)}")
@@ -317,9 +336,14 @@ async def main():
     # Отправляем топ-5 с ПРОВЕРКОЙ НА ДУБЛИКАТЫ ВНУТРИ ЦИКЛА
     sent_count = 0
     sent_data = load_sent_news()
-    sent_urls = set(sent_data.get("urls", []))  # Используем set для быстрой проверки
+    sent_urls = set(sent_data.get("urls", []))
     sent_hashes = set(sent_data.get("hashes", []))
-    already_sent_in_this_run = set()  # Отслеживаем отправленные в ЭТОМ запуске
+    already_sent_in_this_run = set()
+    
+    # Загружаем семантический кэш, чтобы обновить его после успешной отправки
+    if SEMANTIC_DEDUP_ENABLED:
+        from deduplicator import load_state, save_state
+        semantic_state = load_state()
     
     for news in top_news:
         # ПРОВЕРКА: не отправляли ли уже в этом запуске (по хэшу)
@@ -341,12 +365,21 @@ async def main():
             print("✅ Отправлено")
             sent_urls.add(news['link'])
             sent_hashes.add(news['title_hash'])
-            already_sent_in_this_run.add(news['title_hash'])  # Добавляем в set текущего запуска
+            already_sent_in_this_run.add(news['title_hash'])
+            
+            # <<< НОВОЕ: Если отправка успешна, добавляем текст в семантический кэш
+            if SEMANTIC_DEDUP_ENABLED:
+                semantic_state.append({
+                    'text': news.get('text_to_check', f"{news['title']} {news['summary']}"),
+                    'timestamp': datetime.now(timezone.utc).timestamp()
+                })
+                save_state(semantic_state) # Сохраняем файл кэша на диск
+            
             sent_count += 1
         else:
             print("❌ Ошибка отправки")
     
-    # Сохраняем обновлённый список
+    # Сохраняем обновлённый список (ваша старая логика для URL и хэшей)
     save_sent_news({"urls": list(sent_urls), "hashes": list(sent_hashes)})
     
     print("\n" + "=" * 60)
@@ -354,6 +387,6 @@ async def main():
     print(f"Всего сохранено URL: {len(sent_urls)}")
     print(f"Всего сохранено хэшей: {len(sent_hashes)}")
     print("=" * 60)
-    
+
 if __name__ == "__main__":
     asyncio.run(main())
