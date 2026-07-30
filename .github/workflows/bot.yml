@@ -2,13 +2,18 @@ name: Crypto News Bot
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
-  workflow_dispatch:
+    - cron: '0 */4 * * *' # Запуск каждые 4 часа
+  workflow_dispatch: # Ручной запуск
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     
+    # Разрешения для работы с артефактами (по умолчанию достаточно, но явно укажем)
+    permissions:
+      actions: read
+      contents: read
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,12 +23,12 @@ jobs:
         with:
           python-version: '3.11'
       
-      - name: Download sent news artifact
+      - name: Download state artifacts
         uses: actions/download-artifact@v4
         with:
-          name: sent-news
+          name: bot-state
           path: .
-        continue-on-error: true
+        continue-on-error: true # Если это первый запуск, артефакта еще нет, это нормально
       
       - name: Install dependencies
         run: |
@@ -37,10 +42,13 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         run: python main.py
       
-      - name: Upload sent news artifact
+      - name: Upload state artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: sent-news
-          path: sent_news.json
-          retention-days: 90
+          name: bot-state
+          # Сохраняем оба файла состояния
+          path: |
+            sent_news.json
+            sent_news_cache.json
+          retention-days: 30 # 30 дней более чем достаточно для кэша
           overwrite: true
